@@ -1,35 +1,36 @@
 #!/usr/bin/lua
 
 ------------------------------------------------
--- This file from luci-app-ssr-plus transplant to luci-app-passwall
--- This file is part of the luci-app-ssr-plus subscribe.lua
 -- @author William Chan <root@williamchan.me>
 ------------------------------------------------
 require 'nixio'
-require 'uci'
+require 'luci.model.uci'
 require 'luci.util'
 require 'luci.jsonc'
 require 'luci.sys'
+local appname = 'passwall'
+local api = require ("luci.model.cbi." .. appname .. ".api.api")
+local has_xray = api.is_finded("xray")
+local datatypes = require "luci.cbi.datatypes"
 
 -- these global functions are accessed all the time by the event handler
 -- so caching them is worth the effort
-local luci = luci
 local tinsert = table.insert
 local ssub, slen, schar, sbyte, sformat, sgsub = string.sub, string.len, string.char, string.byte, string.format, string.gsub
 local jsonParse, jsonStringify = luci.jsonc.parse, luci.jsonc.stringify
 local b64decode = nixio.bin.b64decode
+local ucic = luci.model.uci.cursor()
+local allowInsecure_default = ucic:get_bool(appname, "@global_subscribe[0]", "allowInsecure")
+ucic:revert(appname)
+
 local nodeResult = {} -- update result
-local application = 'passwall'
-local uciType = 'nodes'
-local ucic2 = uci.cursor()
 local arg2 = arg[2]
-ucic2:revert(application)
 
 local log = function(...)
 	if arg2 then
 		local result = os.date("%Y-%m-%d %H:%M:%S: ") .. table.concat({...}, " ")
 		if arg2 == "log" then
-			local f, err = io.open("/var/log/passwall.log", "a")
+			local f, err = io.open("/var/log/" .. appname .. ".log", "a")
 			if f and err == nil then
 				f:write(result .. "\n")
 				f:close()
@@ -44,50 +45,55 @@ end
 local CONFIG = {}
 do
 	local function import_config(protocol)
-		local node_num = ucic2:get(application, "@global_other[0]", protocol .. "_node_num") or 1
-		for i = 1, node_num, 1 do
-			local name = string.upper(protocol)
-			local szType = "@global[0]"
-			local option = protocol .. "_node" .. i
-			
-			local node = ucic2:get(application, szType, option)
-			local currentNode
-			if node then
-				currentNode = ucic2:get_all(application, node)
+		local name = string.upper(protocol)
+		local szType = "@global[0]"
+		local option = protocol .. "_node"
+		
+		local node_id = ucic:get(appname, szType, option)
+		CONFIG[#CONFIG + 1] = {
+			log = true,
+			remarks = name .. "节点",
+			currentNodeId = node_id,
+			currentNode = node_id and ucic:get_all(appname, node_id) or nil,
+			set = function(o, server)
+				ucic:set(appname, szType, option, server)
+				o.newNodeId = server
 			end
-			CONFIG[#CONFIG + 1] = {
-				log = true,
-				remarks = name .. "节点" .. i,
-				node = node,
-				currentNode = currentNode,
-				set = function(server)
-					ucic2:set(application, szType, option, server)
-				end
-			}
-		end
+		}
 	end
 	import_config("tcp")
 	import_config("udp")
-	import_config("socks")
 
-	local tcp_node1_table = ucic2:get(application, "@auto_switch[0]", "tcp_node1")
-	if tcp_node1_table then
+	local i = 0
+	ucic:foreach(appname, "socks", function(t)
+		i = i + 1
+		local node_id = t.node
+		CONFIG[#CONFIG + 1] = {
+			log = true,
+			id = t[".name"],
+			remarks = "Socks节点列表[" .. i .. "]",
+			currentNodeId = node_id,
+			currentNode = node_id and ucic:get_all(appname, node_id) or nil,
+			set = function(o, server)
+				ucic:set(appname, t[".name"], "node", server)
+				o.newNodeId = server
+			end
+		}
+	end)
+
+	local tcp_node_table = ucic:get(appname, "@auto_switch[0]", "tcp_node")
+	if tcp_node_table then
 		local nodes = {}
 		local new_nodes = {}
-		for k,v in ipairs(tcp_node1_table) do
-			local node = v
-			local currentNode
-			if node then
-				currentNode = ucic2:get_all(application, node)
-			end
+		for k,node in ipairs(tcp_node_table) do
 			nodes[#nodes + 1] = {
-				log = false,
-				node = node,
-				currentNode = currentNode,
-				remarks = node,
-				set = function(server)
+				log = true,
+				remarks = "TCP备用节点的列表[" .. k .. "]",
+				currentNodeId = node,
+				currentNode = node and ucic:get_all(appname, node) or nil,
+				set = function(o, server)
 					for kk, vv in pairs(CONFIG) do
-						if (vv.remarks == "自动切换TCP_1节点列表") then
+						if (vv.remarks == "TCP备用节点的列表") then
 							table.insert(vv.new_nodes, server)
 						end
 					end
@@ -95,99 +101,93 @@ do
 			}
 		end
 		CONFIG[#CONFIG + 1] = {
-			remarks = "自动切换TCP_1节点列表",
+			remarks = "TCP备用节点的列表",
 			nodes = nodes,
 			new_nodes = new_nodes,
-			set = function()
+			set = function(o)
 				for kk, vv in pairs(CONFIG) do
-					if (vv.remarks == "自动切换TCP_1节点列表") then
-						log("刷新自动切换列表")
-						ucic2:set_list(application, "@auto_switch[0]", "tcp_node1", vv.new_nodes)
+					if (vv.remarks == "TCP备用节点的列表") then
+						--log("刷新自动切换的TCP备用节点的列表")
+						ucic:set_list(appname, "@auto_switch[0]", "tcp_node", vv.new_nodes)
 					end
 				end
 			end
 		}
 	end
 
-	ucic2:foreach(application, uciType, function(node)
-		if node.type == 'V2ray_shunt' then
+	ucic:foreach(appname, "nodes", function(node)
+		if node.protocol and node.protocol == '_shunt' then
 			local node_id = node[".name"]
-			local youtube_node_id = node.youtube_node
-			local netflix_node_id = node.netflix_node
-			local default_node_id = node.default_node
+			ucic:foreach(appname, "shunt_rules", function(e)
+				local _node_id = node[e[".name"]] or nil
+				CONFIG[#CONFIG + 1] = {
+					log = false,
+					currentNodeId = _node_id,
+					currentNode = _node_id and ucic:get_all(appname, _node_id) or nil,
+					remarks = "分流" .. e.remarks .. "节点",
+					set = function(o, server)
+						ucic:set(appname, node_id, e[".name"], server)
+						o.newNodeId = server
+					end
+				}
+			end)
 
-			local youtube_node
-			local netflix_node
-			local default_node
-			if youtube_node_id then
-				youtube_node = ucic2:get_all(application, youtube_node_id)
-			end
-			if netflix_node_id then
-				netflix_node = ucic2:get_all(application, netflix_node_id)
-			end
-			if default_node_id then
-				default_node = ucic2:get_all(application, default_node_id)
-			end
+			local default_node_id = node.default_node
 			CONFIG[#CONFIG + 1] = {
-				log = false,
-				currentNode = youtube_node,
-				remarks = "V2ray分流youtube节点",
-				set = function(server)
-					ucic2:set(application, node_id, "youtube_node", server)
+				log = true,
+				currentNodeId = default_node_id,
+				currentNode = default_node_id and ucic:get_all(appname, default_node_id) or nil,
+				remarks = "分流默认节点",
+				set = function(o, server)
+					ucic:set(appname, node_id, "default_node", server)
+					o.newNodeId = server
 				end
 			}
+
+			local main_node_id = node.main_node
 			CONFIG[#CONFIG + 1] = {
-				log = false,
-				currentNode = netflix_node,
-				remarks = "V2ray分流Netflix节点",
-				set = function(server)
-					ucic2:set(application, node_id, "netflix_node", server)
+				log = true,
+				currentNodeId = main_node_id,
+				currentNode = main_node_id and ucic:get_all(appname, main_node_id) or nil,
+				remarks = "分流默认前置代理节点",
+				set = function(o, server)
+					ucic:set(appname, node_id, "main_node", server)
+					o.newNodeId = server
 				end
 			}
-			CONFIG[#CONFIG + 1] = {
-				log = false,
-				currentNode = default_node,
-				remarks = "V2ray分流默认节点",
-				set = function(server)
-					ucic2:set(application, node_id, "default_node", server)
-				end
-			}
-		elseif node.type == 'V2ray_balancing' then
+		elseif node.protocol and node.protocol == '_balancing' then
 			local node_id = node[".name"]
 			local nodes = {}
 			local new_nodes = {}
-			for k, v in pairs(node.v2ray_balancing_node) do
-				local node = v
-				local currentNode
-				if node then
-					currentNode = ucic2:get_all(application, node)
-				end
-				nodes[#nodes + 1] = {
-					log = false,
-					node = node,
-					currentNode = currentNode,
-					remarks = node,
-					set = function(server)
-						for kk, vv in pairs(CONFIG) do
-							if (vv.remarks == "V2ray负载均衡节点列表" .. node_id) then
-								table.insert(vv.new_nodes, server)
+			if node.balancing_node then
+				for k, node in pairs(node.balancing_node) do
+					nodes[#nodes + 1] = {
+						log = false,
+						node = node,
+						currentNode = node and ucic:get_all(appname, node) or nil,
+						remarks = node,
+						set = function(o, server)
+							for kk, vv in pairs(CONFIG) do
+								if (vv.remarks == "负载均衡节点列表" .. node_id) then
+									table.insert(vv.new_nodes, server)
+								end
 							end
 						end
-					end
-				}
+					}
+				end
 			end
 			CONFIG[#CONFIG + 1] = {
-				remarks = "V2ray负载均衡节点列表" .. node_id,
+				remarks = "负载均衡节点列表" .. node_id,
 				nodes = nodes,
 				new_nodes = new_nodes,
-				set = function()
+				set = function(o)
 					for kk, vv in pairs(CONFIG) do
-						if (vv.remarks == "V2ray负载均衡节点列表" .. node_id) then
-							log("刷新V2ray负载均衡节点列表")
-							ucic2:foreach(application, uciType, function(node2)
+						if (vv.remarks == "负载均衡节点列表" .. node_id) then
+							--log("刷新负载均衡节点列表")
+							ucic:foreach(appname, "nodes", function(node2)
 								if node2[".name"] == node[".name"] then
 									local index = node2[".index"]
-									ucic2:set_list(application, "@nodes[" .. index .. "]", "v2ray_balancing_node", vv.new_nodes)
+									ucic:set_list(appname, "@nodes[" .. index .. "]", "balancing_node", vv.new_nodes)
 								end
 							end)
 						end
@@ -213,28 +213,24 @@ do
 end
 
 -- 判断是否过滤节点关键字
-local filter_keyword_enabled = ucic2:get(application, "@global_subscribe[0]", "filter_enabled")
-local filter_keyword_table = ucic2:get(application, "@global_subscribe[0]", "filter_keyword")
-local filter_keyword_discarded = ucic2:get(application, "@global_subscribe[0]", "filter_keyword_discarded")
+local filter_keyword_mode = ucic:get(appname, "@global_subscribe[0]", "filter_keyword_mode") or "0"
+local filter_keyword_discard_list = ucic:get(appname, "@global_subscribe[0]", "filter_discard_list") or {}
+local filter_keyword_keep_list = ucic:get(appname, "@global_subscribe[0]", "filter_keep_list") or {}
 local function is_filter_keyword(value)
-	if filter_keyword_enabled and filter_keyword_enabled == "1" then
-		if filter_keyword_table then
-			if filter_keyword_discarded and filter_keyword_discarded == "1" then
-				for k,v in ipairs(filter_keyword_table) do
-					if value:find(v) then
-						return true
-					end
-				end
-			else
-				local result = true
-				for k,v in ipairs(filter_keyword_table) do
-					if value:find(v) then
-						result = false
-					end
-				end
-				return result
+	if filter_keyword_mode == "1" then
+		for k,v in ipairs(filter_keyword_discard_list) do
+			if value:find(v) then
+				return true
 			end
 		end
+	elseif filter_keyword_mode == "2" then
+		local result = true
+		for k,v in ipairs(filter_keyword_keep_list) do
+			if value:find(v) then
+				result = false
+			end
+		end
+		return result
 	end
 	return false
 end
@@ -272,7 +268,7 @@ end
 
 local function get_urldecode(h) return schar(tonumber(h, 16)) end
 local function UrlDecode(szText)
-	return szText:gsub("+", " "):gsub("%%(%x%x)", get_urldecode)
+	return (szText and szText:gsub("+", " "):gsub("%%(%x%x)", get_urldecode)) or nil
 end
 
 -- trim
@@ -299,6 +295,7 @@ local function base64Decode(text)
 end
 -- 处理数据
 local function processData(szType, content, add_mode)
+	--log(content, add_mode)
 	local result = {
 		timeout = 60,
 		add_mode = add_mode,
@@ -311,7 +308,7 @@ local function processData(szType, content, add_mode)
 		result.address = hostInfo[1]
 		result.port = hostInfo[2]
 		result.protocol = hostInfo[3]
-		result.ssr_encrypt_method = hostInfo[4]
+		result.method = hostInfo[4]
 		result.obfs = hostInfo[5]
 		result.password = base64Decode(hostInfo[6])
 		local params = {}
@@ -326,53 +323,54 @@ local function processData(szType, content, add_mode)
 		result.remarks = base64Decode(params.remarks)
 	elseif szType == 'vmess' then
 		local info = jsonParse(content)
-		result.type = 'V2ray'
+		result.type = 'Xray'
 		result.address = info.add
 		result.port = info.port
-		result.v2ray_protocol = 'vmess'
-		result.v2ray_transport = info.net
-		result.v2ray_VMess_alterId = info.aid
-		result.v2ray_VMess_id = info.id
+		result.protocol = 'vmess'
+		result.alter_id = info.aid
+		result.uuid = info.id
 		result.remarks = info.ps
-		-- result.v2ray_mux = 1
-		-- result.v2ray_mux_concurrency = 8
+		-- result.mux = 1
+		-- result.mux_concurrency = 8
 		if info.net == 'ws' then
-			result.v2ray_ws_host = info.host
-			result.v2ray_ws_path = info.path
+			result.ws_host = info.host
+			result.ws_path = info.path
 		end
 		if info.net == 'h2' then
-			result.v2ray_h2_host = info.host
-			result.v2ray_h2_path = info.path
+			result.h2_host = info.host
+			result.h2_path = info.path
 		end
 		if info.net == 'tcp' then
 			if info.type and info.type ~= "http" then
 				info.type = "none"
 			end
-			result.v2ray_tcp_guise = info.type
-			result.v2ray_tcp_guise_http_host = info.host
-			result.v2ray_tcp_guise_http_path = info.path
+			result.tcp_guise = info.type
+			result.tcp_guise_http_host = info.host
+			result.tcp_guise_http_path = info.path
 		end
-		if info.net == 'kcp' then
-			result.v2ray_mkcp_guise = info.type
-			result.v2ray_mkcp_mtu = 1350
-			result.v2ray_mkcp_tti = 50
-			result.v2ray_mkcp_uplinkCapacity = 5
-			result.v2ray_mkcp_downlinkCapacity = 20
-			result.v2ray_mkcp_readBufferSize = 2
-			result.v2ray_mkcp_writeBufferSize = 2
+		if info.net == 'kcp' or info.net == 'mkcp' then
+			info.net = "mkcp"
+			result.mkcp_guise = info.type
+			result.mkcp_mtu = 1350
+			result.mkcp_tti = 50
+			result.mkcp_uplinkCapacity = 5
+			result.mkcp_downlinkCapacity = 20
+			result.mkcp_readBufferSize = 2
+			result.mkcp_writeBufferSize = 2
 		end
 		if info.net == 'quic' then
-			result.v2ray_quic_guise = info.type
-			result.v2ray_quic_key = info.key
-			result.v2ray_quic_security = info.securty
+			result.quic_guise = info.type
+			result.quic_key = info.key
+			result.quic_security = info.securty
 		end
-		if not info.security then result.v2ray_security = "auto" end
+		result.transport = info.net
+		if not info.security then result.security = "auto" end
 		if info.tls == "tls" or info.tls == "1" then
-			result.v2ray_stream_security = "tls"
-			result.tls_serverName = info.host
-			result.tls_allowInsecure = 1
+			result.tls = "1"
+			result.tls_serverName = info.sni
+			result.tls_allowInsecure = allowInsecure_default and "1" or "0"
 		else
-			result.v2ray_stream_security = "none"
+			result.tls = "0"
 		end
 	elseif szType == "ss" then
 		local idx_sp = 0
@@ -381,16 +379,28 @@ local function processData(szType, content, add_mode)
 			idx_sp = content:find("#")
 			alias = content:sub(idx_sp + 1, -1)
 		end
+		result.remarks = UrlDecode(alias)
 		local info = content:sub(1, idx_sp - 1)
 		local hostInfo = split(base64Decode(info), "@")
-		local host = split(hostInfo[2], ":")
-		local userinfo = base64Decode(hostInfo[1])
+		local hostInfoLen = #hostInfo
+		local host = nil
+		local userinfo = nil
+		if hostInfoLen > 2 then
+			host = split(hostInfo[hostInfoLen], ":")
+			userinfo = {}
+			for i = 1, hostInfoLen - 1 do
+				tinsert(userinfo, hostInfo[i])
+			end
+			userinfo = table.concat(userinfo, '@')
+		else
+			host = split(hostInfo[2], ":")
+			userinfo = base64Decode(hostInfo[1])
+		end
 		local method = userinfo:sub(1, userinfo:find(":") - 1)
 		local password = userinfo:sub(userinfo:find(":") + 1, #userinfo)
-		result.remarks = UrlDecode(alias)
 		result.type = "SS"
 		result.address = host[1]
-		if host[2]:find("/%?") then
+		if host[2] and host[2]:find("/%?") then
 			local query = split(host[2], "/%?")
 			result.port = query[1]
 			local params = {}
@@ -402,20 +412,20 @@ local function processData(szType, content, add_mode)
 				local plugin_info = UrlDecode(params.plugin)
 				local idx_pn = plugin_info:find(";")
 				if idx_pn then
-					result.ss_plugin = plugin_info:sub(1, idx_pn - 1)
-					result.ss_plugin_opts =
+					result.plugin = plugin_info:sub(1, idx_pn - 1)
+					result.plugin_opts =
 						plugin_info:sub(idx_pn + 1, #plugin_info)
 				else
-					result.ss_plugin = plugin_info
+					result.plugin = plugin_info
 				end
 			end
-			if result.ss_plugin and result.ss_plugin == "simple-obfs" then
-				result.ss_plugin = "obfs-local"
+			if result.plugin and result.plugin == "simple-obfs" then
+				result.plugin = "obfs-local"
 			end
 		else
 			result.port = host[2]
 		end
-		result.ss_encrypt_method = method
+		result.method = method
 		result.password = password
 	elseif szType == "trojan" then
 		local alias = ""
@@ -424,175 +434,373 @@ local function processData(szType, content, add_mode)
 			alias = content:sub(idx_sp + 1, -1)
 			content = content:sub(0, idx_sp - 1)
 		end
-		local Info = split(content, "@")
-		if Info then
-			local address, port, peer
-			local password = Info[1]
-			local allowInsecure = 1
-			local params = {}
-			local hostInfo = split(Info[2], ":")
-			if hostInfo then
-				address = hostInfo[1]
-				hostInfo = split(hostInfo[2], "?")
-				if hostInfo then
-					port = hostInfo[1]
-					for _, v in pairs(split(hostInfo[2], '&')) do
-						local t = split(v, '=')
-						params[t[1]] = t[2]
-					end
-					if params.allowInsecure then
-						allowInsecure = params.allowInsecure
-					end
-					if params.peer then peer = params.peer end
+		result.remarks = UrlDecode(alias)
+		result.type = "Trojan-Plus"
+		if has_xray then
+			result.type = 'Xray'
+			result.protocol = 'trojan'
+		end
+		if content:find("@") then
+			local Info = split(content, "@")
+			result.password = UrlDecode(Info[1])
+			local port = "443"
+			Info[2] = (Info[2] or ""):gsub("/%?", "?")
+			local hostInfo = nil
+			if Info[2]:find(":") then
+				hostInfo = split(Info[2], ":")
+				result.address = hostInfo[1]
+				local idx_port = 2
+				if hostInfo[2]:find("?") then
+					hostInfo = split(hostInfo[2], "?")
+					idx_port = 1
 				end
+				if hostInfo[idx_port] ~= "" then port = hostInfo[idx_port] end
+			else
+				if Info[2]:find("?") then
+					hostInfo = split(Info[2], "?")
+				end
+				result.address = hostInfo and hostInfo[1] or Info[2]
 			end
-			result.type = "Trojan"
-			result.address = address
+			local peer, sni = nil, ""
+			local allowInsecure = allowInsecure_default
+			local query = split(Info[2], "?")
+			local params = {}
+			for _, v in pairs(split(query[2], '&')) do
+				local t = split(v, '=')
+				params[string.lower(t[1])] = UrlDecode(t[2])
+			end
+			if params.allowinsecure then
+				allowInsecure = params.allowinsecure
+			end
+			if params.peer then peer = params.peer end
+			sni = params.sni and params.sni or ""
+			if params.ws and params.ws == "1" then
+				result.trojan_transport = "ws"
+				if params.wshost then result.ws_host = params.wshost end
+				if params.wspath then result.ws_path = params.wspath end
+				if sni == "" and params.wshost then sni = params.wshost end
+			end
+			if params.ss and params.ss == "1" then
+				result.ss_aead = "1"
+				if params.ssmethod then result.ss_aead_method = string.lower(params.ssmethod) end
+				if params.sspasswd then result.ss_aead_pwd = params.sspasswd end
+			end
 			result.port = port
-			result.password = password
-			result.tls_allowInsecure = allowInsecure
-			result.tls_serverName = peer
-			result.remarks = UrlDecode(alias)
+			if result.trojan_transport == "ws" or result.ss_aead then
+				result.type = "Trojan-Go"
+				result.fingerprint = "firefox"
+				result.mux = "1"
+			end
+			result.tls = '1'
+			result.tls_serverName = peer and peer or sni
+			result.tls_allowInsecure = allowInsecure and "1" or "0"
+		end
+	elseif szType == "trojan-go" then
+		local alias = ""
+		if content:find("#") then
+			local idx_sp = content:find("#")
+			alias = content:sub(idx_sp + 1, -1)
+			content = content:sub(0, idx_sp - 1)
+		end
+		result.remarks = UrlDecode(alias)
+		result.type = "Trojan-Go"
+		if content:find("@") then
+			local Info = split(content, "@")
+			result.password = UrlDecode(Info[1])
+			local port = "443"
+			Info[2] = (Info[2] or ""):gsub("/%?", "?")
+			local hostInfo = nil
+			if Info[2]:find(":") then
+				hostInfo = split(Info[2], ":")
+				result.address = hostInfo[1]
+				local idx_port = 2
+				if hostInfo[2]:find("?") then
+					hostInfo = split(hostInfo[2], "?")
+					idx_port = 1
+				end
+				if hostInfo[idx_port] ~= "" then port = hostInfo[idx_port] end
+			else
+				if Info[2]:find("?") then
+					hostInfo = split(Info[2], "?")
+				end
+				result.address = hostInfo and hostInfo[1] or Info[2]
+			end
+			local peer, sni = nil, ""
+			local query = split(Info[2], "?")
+			local params = {}
+			for _, v in pairs(split(query[2], '&')) do
+				local t = split(v, '=')
+				params[string.lower(t[1])] = UrlDecode(t[2])
+			end
+			if params.peer then peer = params.peer end
+			sni = params.sni and params.sni or ""
+			if params.type and params.type == "ws" then
+				result.trojan_transport = "ws"
+				if params.host then result.ws_host = params.host end
+				if params.path then result.ws_path = params.path end
+				if sni == "" and params.host then sni = params.host end
+			end
+			if params.encryption and params.encryption:match('^ss;[^;:]*[;:].*$') then
+				result.ss_aead = "1"
+				result.ss_aead_method, result.ss_aead_pwd = params.encryption:match('^ss;([^;:]*)[;:](.*)$')
+				result.ss_aead_method = string.lower(result.ss_aead_method)
+			end
+			result.port = port
+			result.fingerprint = "firefox"
+			result.tls = "1"
+			result.tls_serverName = peer and peer or sni
+			result.tls_allowInsecure = "0"
+			result.mux = "1"
 		end
 	elseif szType == "ssd" then
 		result.type = "SS"
 		result.address = content.server
 		result.port = content.port
 		result.password = content.password
-		result.ss_encrypt_method = content.encryption
-		result.ss_plugin = content.plugin
-		result.ss_plugin_opts = content.plugin_options
+		result.method = content.encryption
+		result.plugin = content.plugin
+		result.plugin_opts = content.plugin_options
 		result.group = content.airport
 		result.remarks = content.remarks
+	elseif szType == "vless" then
+		result.type = "Xray"
+		result.protocol = "vless"
+		local alias = ""
+		if content:find("#") then
+			local idx_sp = content:find("#")
+			alias = content:sub(idx_sp + 1, -1)
+			content = content:sub(0, idx_sp - 1)
+		end
+		result.remarks = UrlDecode(alias)
+		if content:find("@") then
+			local Info = split(content, "@")
+			result.uuid = UrlDecode(Info[1])
+			local port = "443"
+			Info[2] = (Info[2] or ""):gsub("/%?", "?")
+			local hostInfo = nil
+			if Info[2]:find(":") then
+				hostInfo = split(Info[2], ":")
+				result.address = hostInfo[1]
+				local idx_port = 2
+				if hostInfo[2]:find("?") then
+					hostInfo = split(hostInfo[2], "?")
+					idx_port = 1
+				end
+				if hostInfo[idx_port] ~= "" then port = hostInfo[idx_port] end
+			else
+				if Info[2]:find("?") then
+					hostInfo = split(Info[2], "?")
+				end
+				result.address = hostInfo and hostInfo[1] or Info[2]
+			end
+			
+			local query = split(Info[2], "?")
+			local params = {}
+			for _, v in pairs(split(query[2], '&')) do
+				local t = split(v, '=')
+				params[t[1]] = UrlDecode(t[2])
+			end
+
+			if params.type == 'ws' then
+				result.ws_host = params.host
+				result.ws_path = params.path
+			end
+			if params.type == 'h2' then
+				result.h2_host = params.host
+				result.h2_path = params.path
+			end
+			if params.type == 'tcp' then
+				result.tcp_guise = params.headerType or "none"
+				result.tcp_guise_http_host = params.host
+				result.tcp_guise_http_path = params.path
+			end
+			if params.type == 'kcp' or params.type == 'mkcp' then
+				params.type = "mkcp"
+				result.mkcp_guise = params.headerType or "none"
+				result.mkcp_mtu = 1350
+				result.mkcp_tti = 50
+				result.mkcp_uplinkCapacity = 5
+				result.mkcp_downlinkCapacity = 20
+				result.mkcp_readBufferSize = 2
+				result.mkcp_writeBufferSize = 2
+			end
+			if params.type == 'quic' then
+				result.quic_guise = params.headerType or "none"
+				result.quic_key = params.key
+				result.quic_security = params.quicSecurity or "none"
+			end
+			result.transport = params.type
+			
+			result.encryption = params.encryption or "none"
+
+			result.tls = "0"
+			if params.security == "tls" or params.security == "xtls" then
+				result.tls = "1"
+				if params.security == "xtls" then
+					result.xtls = "1"
+					result.flow = params.flow or "xtls-rprx-direct"
+				end
+				if params.sni then
+					result.tls_serverName = params.sni
+				end
+			end
+
+			result.port = port
+			result.tls_allowInsecure = allowInsecure_default and "1" or "0"
+		end
 	else
 		log('暂时不支持' .. szType .. "类型的节点订阅，跳过此节点。")
 		return nil
 	end
-	if not result.remarks then
-		result.remarks = result.address .. ':' .. result.port
+	if not result.remarks or result.remarks == "" then
+		if result.address and result.port then
+			result.remarks = result.address .. ':' .. result.port
+		else
+			result.remarks = "NULL"
+		end
 	end
 	return result
 end
--- wget
-local function wget(url)
+
+-- curl
+local function curl(url)
 	local ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.122 Safari/537.36"
-	local stdout = luci.sys.exec('/usr/bin/wget --user-agent="' .. ua .. '" --no-check-certificate -t 3 -T 10 -O- "' .. url .. '"')
+	local stdout = luci.sys.exec('curl -sL --user-agent "' .. ua .. '" -k --retry 3 --connect-timeout 3 "' .. url .. '"')
 	return trim(stdout)
 end
 
 local function truncate_nodes()
-	local is_stop = 0
-	local function clear(type)
-		local node_num = ucic2:get(application, "@global_other[0]", type .. "_node_num") or 1
-		for i = 1, node_num, 1 do
-			local node = ucic2:get(application, "@global[0]", type.."_node" .. i)
-			if node then
-				local is_sub_node = ucic2:get(application, node, "is_sub") or 0
-				if is_sub_node == "1" then
-					is_stop = 1
-					ucic2:set(application, '@global[0]', type.."_node" .. i, "nil")
+	for _, config in pairs(CONFIG) do
+		if config.nodes and type(config.nodes) == "table" then
+			for kk, vv in pairs(config.nodes) do
+				if vv.currentNode.is_sub and vv.currentNode.is_sub == "1" then
+				else
+					vv.set(vv, vv.currentNodeId)
+				end
+			end
+			config.set(config)
+		else
+			if config.currentNode.is_sub and config.currentNode.is_sub == "1" then
+				config.set(config, "nil")
+				if config.id then
+					ucic:delete(appname, config.id)
 				end
 			end
 		end
 	end
-	clear("tcp")
-	clear("udp")
-	clear("socks")
-
-	ucic2:foreach(application, uciType, function(node)
+	ucic:foreach(appname, "nodes", function(node)
 		if (node.is_sub or node.hashkey) and node.add_mode ~= '导入' then
-			ucic2:delete(application, node['.name'])
+			ucic:delete(appname, node['.name'])
 		end
 	end)
-	ucic2:commit(application)
+	ucic:commit(appname)
 
-	if is_stop == 1 then
-		luci.sys.call("/etc/init.d/" .. application .. " restart > /dev/null 2>&1 &") -- 不加&的话日志会出现的更早
-	end
 	log('在线订阅节点已全部删除')
 end
 
 local function select_node(nodes, config)
 	local server
 	if config.currentNode then
-		-- 特别优先级 V2ray分流 + 备注
-		if config.currentNode.type == 'V2ray_shunt' then
-			for id, node in pairs(nodes) do
+		-- 特别优先级 分流 + 备注
+		if config.currentNode.protocol and config.currentNode.protocol == '_shunt' then
+			for index, node in pairs(nodes) do
 				if node.remarks == config.currentNode.remarks then
-					log('选择【' .. config.remarks .. '】V2ray分流匹配节点：' .. node.remarks)
-					server = id
+					log('更新【' .. config.remarks .. '】分流匹配节点：' .. node.remarks)
+					server = node[".name"]
 					break
 				end
 			end
 		end
-		-- 特别优先级 V2ray负载均衡 + 备注
-		if config.currentNode.type == 'V2ray_balancing' then
-			for id, node in pairs(nodes) do
+		-- 特别优先级 负载均衡 + 备注
+		if config.currentNode.protocol and config.currentNode.protocol == '_balancing' then
+			for index, node in pairs(nodes) do
 				if node.remarks == config.currentNode.remarks then
-					log('选择【' .. config.remarks .. '】V2ray负载均衡匹配节点：' .. node.remarks)
-					server = id
+					log('更新【' .. config.remarks .. '】负载均衡匹配节点：' .. node.remarks)
+					server = node[".name"]
 					break
 				end
 			end
 		end
-		-- 第一优先级 IP + 端口
+		-- 第一优先级 cfgid
 		if not server then
-			for id, node in pairs(nodes) do
-				if node.address and node.port then
-					if node.address .. ':' .. node.port == config.currentNode.address .. ':' .. config.currentNode.port then
-						if config.log == nil or config.log == true then
-							log('选择【' .. config.remarks .. '】第一匹配节点：' .. node.remarks)
-						end
-						server = id
-						break
-					end
-				end
-			end
-		end
-		-- 第二优先级 IP
-		if not server then
-			for id, node in pairs(nodes) do
-				if node.address then
-					if node.address == config.currentNode.address then
-						if config.log == nil or config.log == true then
-							log('选择【' .. config.remarks .. '】第二匹配节点：' .. node.remarks)
-						end
-						server = id
-						break
-					end
-				end
-			end
-		end
-		-- 第三优先级备注
-		if not server then
-			for id, node in pairs(nodes) do
-				if node.remarks then
-					if node.remarks == config.currentNode.remarks then
-						if config.log == nil or config.log == true then
-							log('选择【' .. config.remarks .. '】第三匹配节点：' .. node.remarks)
-						end
-						server = id
-						break
-					end
-				end
-			end
-		end
-		-- 第四 cfgid
-		if not server then
-			for id, node in pairs(nodes) do
-				if id == config.currentNode['.name'] then
+			for index, node in pairs(nodes) do
+				if node[".name"] == config.currentNode['.name'] then
 					if config.log == nil or config.log == true then
-						log('选择【' .. config.remarks .. '】第四匹配节点：' .. node.remarks)
+						log('更新【' .. config.remarks .. '】第一匹配节点：' .. node.remarks)
 					end
-					server = id
+					server = node[".name"]
 					break
+				end
+			end
+		end
+		-- 第二优先级 类型 + IP + 端口
+		if not server then
+			for index, node in pairs(nodes) do
+				if config.currentNode.type and config.currentNode.address and config.currentNode.port then
+					if node.type and node.address and node.port then
+						if node.type == config.currentNode.type and (node.address .. ':' .. node.port == config.currentNode.address .. ':' .. config.currentNode.port) then
+							if config.log == nil or config.log == true then
+								log('更新【' .. config.remarks .. '】第二匹配节点：' .. node.remarks)
+							end
+							server = node[".name"]
+							break
+						end
+					end
+				end
+			end
+		end
+		-- 第三优先级 IP + 端口
+		if not server then
+			for index, node in pairs(nodes) do
+				if config.currentNode.address and config.currentNode.port then
+					if node.address and node.port then
+						if node.address .. ':' .. node.port == config.currentNode.address .. ':' .. config.currentNode.port then
+							if config.log == nil or config.log == true then
+								log('更新【' .. config.remarks .. '】第三匹配节点：' .. node.remarks)
+							end
+							server = node[".name"]
+							break
+						end
+					end
+				end
+			end
+		end
+		-- 第四优先级 IP
+		if not server then
+			for index, node in pairs(nodes) do
+				if config.currentNode.address then
+					if node.address then
+						if node.address == config.currentNode.address then
+							if config.log == nil or config.log == true then
+								log('更新【' .. config.remarks .. '】第四匹配节点：' .. node.remarks)
+							end
+							server = node[".name"]
+							break
+						end
+					end
+				end
+			end
+		end
+		-- 第五优先级备注
+		if not server then
+			for index, node in pairs(nodes) do
+				if config.currentNode.remarks then
+					if node.remarks then
+						if node.remarks == config.currentNode.remarks then
+							if config.log == nil or config.log == true then
+								log('更新【' .. config.remarks .. '】第五匹配节点：' .. node.remarks)
+							end
+							server = node[".name"]
+							break
+						end
+					end
 				end
 			end
 		end
 	end
 	-- 还不行 随便找一个
 	if not server then
-		server = ucic2:get_all(application, '@' .. uciType .. '[0]')
+		server = ucic:get_all(appname, '@' .. "nodes" .. '[0]')
 		if server then
 			if config.log == nil or config.log == true then
 				log('【' .. config.remarks .. '】' .. '无法找到最匹配的节点，当前已更换为：' .. server.remarks)
@@ -601,7 +809,7 @@ local function select_node(nodes, config)
 		end
 	end
 	if server then
-		config.set(server)
+		config.set(config, server)
 	end
 end
 
@@ -610,37 +818,36 @@ local function update_node(manual)
 		log("更新失败，没有可用的节点信息")
 		return
 	end
-	-- delet all for subscribe nodes
-	ucic2:foreach(application, uciType, function(node)
+	-- delete all for subscribe nodes
+	ucic:foreach(appname, "nodes", function(node)
 		-- 如果是手动导入的节点就不参与删除
 		if manual == 0 and (node.is_sub or node.hashkey) and node.add_mode ~= '导入' then
-			ucic2:delete(application, node['.name'])
+			ucic:delete(appname, node['.name'])
 		end
 	end)
 	for _, v in ipairs(nodeResult) do
 		for _, vv in ipairs(v) do
-			local cfgid = ucic2:add(application, uciType)
+			local cfgid = ucic:section(appname, "nodes", api.gen_uuid())
 			for kkk, vvv in pairs(vv) do
-				ucic2:set(application, cfgid, kkk, vvv)
+				ucic:set(appname, cfgid, kkk, vvv)
 			end
 		end
 	end
-	ucic2:commit(application)
+	ucic:commit(appname)
 
 	if next(CONFIG) then
 		local nodes = {}
-		local ucic3 = uci.cursor()
-		ucic3:foreach(application, uciType, function(node)
-			if (node.port and node.address and node.remarks) or node.type == 'V2ray_shunt' or node.type == 'V2ray_balancing' then
-				nodes[node['.name']] = node
-			end
+		local ucic2 = luci.model.uci.cursor()
+		ucic2:foreach(appname, "nodes", function(node)
+			nodes[#nodes + 1] = node
 		end)
+
 		for _, config in pairs(CONFIG) do
 			if config.nodes and type(config.nodes) == "table" then
 				for kk, vv in pairs(config.nodes) do
 					select_node(nodes, vv)
 				end
-				config.set()
+				config.set(config)
 			else
 				select_node(nodes, config)
 			end
@@ -649,18 +856,22 @@ local function update_node(manual)
 		--[[
 		for k, v in pairs(CONFIG) do
 			if type(v.new_nodes) == "table" and #v.new_nodes > 0 then
+				local new_node_list = ""
 				for kk, vv in pairs(v.new_nodes) do
-					print(vv)
+					new_node_list = new_node_list .. vv .. " "
+				end
+				if new_node_list ~= "" then
+					print(v.remarks, new_node_list)
 				end
 			else
-				print(v.new_nodes)
+				print(v.remarks, v.newNodeId)
 			end
 		end
 		]]--
 
-		ucic2:commit(application)
-		luci.sys.call("/etc/init.d/" .. application .. " restart > /dev/null 2>&1 &") -- 不加&的话日志会出现的更早
+		ucic:commit(appname)
 	end
+	luci.sys.call("/etc/init.d/" .. appname .. " restart > /dev/null 2>&1 &")
 end
 
 local function parse_link(raw, remark, manual)
@@ -708,7 +919,7 @@ local function parse_link(raw, remark, manual)
 					local node = trim(v)
 					local dat = split(node, "://")
 					if dat and dat[1] and dat[2] then
-						if dat[1] == 'ss' or dat[1] == 'trojan' then
+						if dat[1] == 'ss' or dat[1] == 'trojan' or dat[1] == 'trojan-go' then
 							result = processData(dat[1], dat[2], add_mode)
 						else
 							result = processData(dat[1], base64Decode(dat[2]), add_mode)
@@ -719,20 +930,19 @@ local function parse_link(raw, remark, manual)
 				end
 				-- log(result)
 				if result then
-					if is_filter_keyword(result.remarks) or
+					if (not manual and is_filter_keyword(result.remarks)) or
 						not result.address or
-						result.address:match("[^0-9a-zA-Z%-%_%.%s]") or -- 中文做地址的 也没有人拿中文域名搞，就算中文域也有Puny Code SB 机场
-						not result.address:find("%.") or -- 虽然没有.也算域，不过应该没有人会这样干吧
-						result.address:sub(#result.address) == "." -- 结尾是.
+						result.remarks == "NULL" or
+						(not datatypes.hostname(result.address) and not (datatypes.ipmask4(result.address) or datatypes.ipmask6(result.address)))
 					then
-						log('丢弃无效节点: ' .. result.type .. ' 节点, ' .. result.remarks)
+						log('丢弃过滤节点: ' .. result.type .. ' 节点, ' .. result.remarks)
 					else
 						tinsert(all_nodes, result)
 					end
 				end
 			end
 		end
-		log('成功解析节点数量: ' .. #nodes)
+		log('成功解析节点数量: ' .. #all_nodes)
 	else
 		if not manual then
 			log('获取到的节点内容为空...')
@@ -743,13 +953,13 @@ end
 local execute = function()
 	-- exec
 	do
-		ucic2:foreach(application, "subscribe_list", function(obj)
+		ucic:foreach(appname, "subscribe_list", function(obj)
 			local enabled = obj.enabled or nil
 			if enabled and enabled == "1" then
 				local remark = obj.remark
 				local url = obj.url
 				log('正在订阅: ' .. url)
-				local raw = wget(url)
+				local raw = curl(url)
 				parse_link(raw, remark)
 			end
 		end)
@@ -760,7 +970,7 @@ end
 
 if arg[1] then
 	if arg[1] == "start" then
-		local count = luci.sys.exec("echo -n $(uci show " .. application .. " | grep @subscribe_list | grep -c \"enabled='1'\")")
+		local count = luci.sys.exec("echo -n $(uci show " .. appname .. " | grep @subscribe_list | grep -c \"enabled='1'\")")
 		if count and tonumber(count) > 0 then
 			log('开始订阅...')
 			xpcall(execute, function(e)
